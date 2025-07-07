@@ -1,12 +1,14 @@
 # 📁 File: backend/auth.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Cookie, Response
 from sqlalchemy.orm import Session
 
 from db import get_db
-from models import User
+from models import User, TokenBlacklist
 from schemas import UserCreate, UserOut, UserLogin, Token
-from utils import hash_password, verify_password, create_access_token
+from jose import JWTError, jwt
+from utils import SECRET_KEY, ALGORITHM
+from utils import hash_password, verify_password, create_access_token, create_refresh_token
 from dependencies import get_current_user
 from security import create_password_reset_token, verify_password_reset_token
 
@@ -44,26 +46,37 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 # Authenticates user and returns JWT token
 # ------------------------------------------------------------
 @router.post("/login", response_model=Token)
-def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
-    # 🔎 Check if user with this email exists
+def login(user_credentials: UserLogin, response: Response, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == user_credentials.email).first()
 
     if not user or not verify_password(user_credentials.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Invalid email or password")
 
-    # 🔑 Generate JWT token with user's email
     access_token = create_access_token(data={"sub": user.email})
+    refresh_token, jti = create_refresh_token(data={"sub": user.email})
 
-    # 🪪 Return token payload
+    # 🍪 Set refresh token in secure HTTP-only cookie
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=False,  # Change to True in production (HTTPS only)
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60,
+        path="/auth"  # Limit cookie scope to auth routes
+    )
+
     return {"access_token": access_token, "token_type": "bearer"}
 
 # ------------------------------------------------------------
 # 🔐 Route: GET /auth/me
 # Returns the current user based on JWT token
 # ------------------------------------------------------------
+
 @router.get("/me", response_model=UserOut)
 def read_current_user(current_user: User = Depends(get_current_user)):
     return current_user
+
 
 # ------------------------------------------------------------
 # 📩 Route: POST /auth/request-password-reset
@@ -111,3 +124,56 @@ def reset_password(
     return {"message": "Password updated successfully"}
 
 
+@router.post("/logout")
+def logout(
+    response: Response,
+    request: Request,
+    db: Session = Depends(get_db),
+    refresh_token: str = Cookie(None)
+):
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="No refresh token found")
+
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti = payload.get("jti")
+
+        # ❌ Add to blacklist
+        db.add(TokenBlacklist(jti=jti))
+        db.commit()
+
+        # 🧼 Clear the refresh_token cookie
+        response.delete_cookie("refresh_token", path="/auth")
+
+        return {"message": "Logged out successfully"}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    
+# 🧠 Refresh access token using HTTP-only cookie
+@router.post("/refresh", response_model=Token)
+def refresh_token(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    refresh_token: str = Cookie(None)  # 🔍 Read refresh_token from HTTP-only cookie
+):
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti = payload.get("jti")
+        email = payload.get("sub")
+
+        # ❌ Check if token is blacklisted
+        blacklisted = db.query(TokenBlacklist).filter(TokenBlacklist.jti == jti).first()
+        if blacklisted:
+            raise HTTPException(status_code=401, detail="Token has been revoked")
+
+        # 🔑 Issue new access token
+        new_access_token = create_access_token(data={"sub": email})
+        return {"access_token": new_access_token, "token_type": "bearer"}
+
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
