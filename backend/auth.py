@@ -1,12 +1,14 @@
 # 📁 File: backend/auth.py
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from db import get_db
 from models import User
 from schemas import UserCreate, UserOut, UserLogin, Token
 from utils import hash_password, verify_password, create_access_token
+from dependencies import get_current_user
+from security import create_password_reset_token, verify_password_reset_token
 
 router = APIRouter()
 
@@ -54,3 +56,58 @@ def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
 
     # 🪪 Return token payload
     return {"access_token": access_token, "token_type": "bearer"}
+
+# ------------------------------------------------------------
+# 🔐 Route: GET /auth/me
+# Returns the current user based on JWT token
+# ------------------------------------------------------------
+@router.get("/me", response_model=UserOut)
+def read_current_user(current_user: User = Depends(get_current_user)):
+    return current_user
+
+# ------------------------------------------------------------
+# 📩 Route: POST /auth/request-password-reset
+# Accepts email, returns a secure reset token (dev only)
+# ------------------------------------------------------------
+@router.post("/request-password-reset", status_code=status.HTTP_200_OK)
+def request_password_reset(email: str, db: Session = Depends(get_db)):
+    # 🔎 Check if user exists with this email
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User with this email not found")
+
+    # 🔐 Generate secure reset token
+    reset_token = create_password_reset_token(user.email)
+
+    # ✉️ In production, send via email — for now return it
+    return {"reset_token": reset_token}
+
+# ------------------------------------------------------------
+# 🔑 Route: POST /auth/reset-password
+# Accepts token + new password, updates password securely
+# ------------------------------------------------------------
+@router.post("/reset-password", status_code=status.HTTP_200_OK)
+def reset_password(
+    token: str,
+    new_password: str,
+    db: Session = Depends(get_db)
+):
+    # ✅ Verify the token
+    email = verify_password_reset_token(token)
+    if email is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    # 🔎 Look up user by email
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 🔒 Hash the new password
+    user.hashed_password = hash_password(new_password)
+
+    # 💾 Save changes
+    db.commit()
+
+    return {"message": "Password updated successfully"}
+
+
