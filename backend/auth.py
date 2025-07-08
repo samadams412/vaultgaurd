@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Cookie, Response
 from sqlalchemy.orm import Session
-
+from uuid import uuid4
 from db import get_db
 from models import User, TokenBlacklist
 from schemas import UserCreate, UserOut, UserLogin, Token
@@ -52,18 +52,20 @@ def login(user_credentials: UserLogin, response: Response, db: Session = Depends
     if not user or not verify_password(user_credentials.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Invalid email or password")
 
-    access_token = create_access_token(data={"sub": user.email})
-    refresh_token, jti = create_refresh_token(data={"sub": user.email})
+    jti = str(uuid4())  # Generate a JTI for access token
+    access_token = create_access_token(data={"sub": user.email, "jti": jti})
 
-    # 🍪 Set refresh token in secure HTTP-only cookie
+    # Still generate refresh token separately
+    refresh_token, refresh_jti = create_refresh_token(data={"sub": user.email})
+
     response.set_cookie(
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=False,  # Change to True in production (HTTPS only)
+        secure=False,  # Change to True in production
         samesite="lax",
         max_age=7 * 24 * 60 * 60,
-        path="/auth"  # Limit cookie scope to auth routes
+        path="/auth"
     )
 
     return {"access_token": access_token, "token_type": "bearer"}
