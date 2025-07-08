@@ -1,5 +1,6 @@
 // src/context/AuthContext.tsx
 import React, { createContext, useContext, useEffect, useState } from "react";
+import { fetchWithAuth } from "../lib/fetchWithAuth";
 
 type User = {
   email: string;
@@ -16,37 +17,66 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
 
-  // 🔄 On load, fetch user if token exists
+  // ✅ Attempt to fetch current user or refresh access token on mount
   useEffect(() => {
     const fetchUser = async () => {
-      const token = localStorage.getItem("accessToken");
-      if (!token) return;
+      let token = localStorage.getItem("accessToken");
 
-      try {
-        const res = await fetch("http://localhost:8000/auth/me", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-
+      // Try /auth/me with current token if present
+      if (token) {
+        const res = await fetchWithAuth("http://localhost:8000/auth/me");
         if (res.ok) {
           const data = await res.json();
           setUser(data);
+          return;
+        }
+      }
+
+      // 🚨 Attempt to refresh access token using secure cookie
+      try {
+        const refreshRes = await fetch("http://localhost:8000/auth/refresh", {
+          method: "POST",
+          credentials: "include", // Important for sending HTTP-only cookie
+        });
+
+        if (!refreshRes.ok) {
+          localStorage.removeItem("accessToken");
+          setUser(null);
+          return;
+        }
+
+        const { access_token } = await refreshRes.json();
+        localStorage.setItem("accessToken", access_token);
+
+        // Fetch user with new token
+        const userRes = await fetch("http://localhost:8000/auth/me", {
+          headers: {
+            Authorization: `Bearer ${access_token}`,
+          },
+        });
+
+        if (userRes.ok) {
+          const userData = await userRes.json();
+          setUser(userData);
         } else {
-          console.warn("Invalid token");
           localStorage.removeItem("accessToken");
         }
       } catch (err) {
-        console.error("Failed to fetch user:", err);
+        console.error("Token refresh failed:", err);
+        localStorage.removeItem("accessToken");
       }
     };
 
     fetchUser();
   }, []);
 
+  // 🔐 Login + user fetch
   const login = async (email: string, password: string) => {
     const res = await fetch("http://localhost:8000/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
+      credentials: "include",
     });
 
     if (!res.ok) throw new Error("Login failed");
@@ -54,17 +84,14 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     const data = await res.json();
     localStorage.setItem("accessToken", data.access_token);
 
-    // 🔥 Immediately fetch user after login
     const meRes = await fetch("http://localhost:8000/auth/me", {
       headers: { Authorization: `Bearer ${data.access_token}` },
     });
 
-    if (meRes.ok) {
-      const userData = await meRes.json();
-      setUser(userData);
-    } else {
-      throw new Error("Failed to fetch user after login");
-    }
+    if (!meRes.ok) throw new Error("Failed to fetch user after login");
+
+    const userData = await meRes.json();
+    setUser(userData);
   };
 
   const logout = () => {
